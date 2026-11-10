@@ -1,6 +1,5 @@
 # Sistema de Votação Eletrônica Seguro
 
-Trabalho final de CIC0201 Segurança Computacional (UnB, 2026/2).
 
 Projeto e implementação, em Python, de um sistema de votação eletrônica que conduz uma eleição completa, do cadastro dos eleitores à apuração e auditoria do resultado. Os votos nunca são decifrados individualmente: apenas o total de cada candidato é revelado, e qualquer pessoa pode conferir o resultado usando somente dados públicos. As propriedades de segurança devem valer mesmo diante de participantes maliciosos, incluindo o próprio administrador do sistema.
 
