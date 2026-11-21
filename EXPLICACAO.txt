@@ -1,0 +1,493 @@
+EXPLICAÇÃO DO CÓDIGO - SISTEMA DE VOTAÇÃO ELETRÔNICA SEGURO
+===========================================================
+
+O código não tem comentários: toda a explicação está neste arquivo.
+Leia na ordem abaixo, com o arquivo correspondente aberto ao lado.
+
+Ordem de leitura:
+  1. util.py          (base usada por todos)
+  2. params.py        (grupo matemático)
+  3. elgamal.py       (cifragem e apuração)                 -> Parte 1
+  4. provas.py        (provas de conhecimento zero)         -> Partes 1 e 2
+  5. assinatura.py    (RSA-PSS)                             -> Parte 3
+  6. autoridade.py    (chave conjunta e decifração)         -> Parte 2
+  7. quadro.py        (quadro público encadeado)            -> Parte 3
+  8. servidor.py      (regras da eleição)                   -> Parte 3
+  9. eleitor.py       (voto e recibo)                       -> Parte 3
+ 10. auditor.py       (auditoria independente)              -> Parte 4
+ 11. main.py, adulterar.py, voto_invalido.py, roteiro_demo.sh -> Parte 4
+ 12. testes/ (fica nesta pasta de estudo, fora da entrega)
+
+
+-----------------------------------------------------------
+CONCEITOS USADOS EM TODO O CÓDIGO
+-----------------------------------------------------------
+
+Grupo: números módulo um primo P de 2048 bits. P é um "primo seguro":
+P = 2Q + 1, com Q também primo. G = 2 gera um subgrupo de ordem Q
+(G^Q = 1 mod P). Todas as chaves e cifras vivem nesse subgrupo.
+
+ElGamal exponencial: a cifra de um voto m (0 ou 1) com a chave
+pública h é (c1, c2) = (G^r, G^m * h^r), com r aleatório.
+Multiplicar cifras soma os votos:
+  (G^r1, G^m1 h^r1) * (G^r2, G^m2 h^r2) = (G^(r1+r2), G^(m1+m2) h^(r1+r2))
+
+Chave conjunta: cada autoridade i tem um segredo x_i e publica
+h_i = G^x_i. A chave da eleição é h = h_1 * h_2 * h_3 = G^(x_1+x_2+x_3).
+O segredo completo x = x_1 + x_2 + x_3 nunca é calculado.
+
+Decifração do total: com o produto (C1, C2) = (G^R, G^T * h^R),
+cada autoridade publica d_i = C1^x_i, e
+  C2 / (d_1 * d_2 * d_3) = G^T * h^R / G^(R*(x_1+x_2+x_3)) = G^T.
+T (total de votos) sai por força bruta, porque é pequeno.
+
+Prova de conhecimento zero: convence alguém de que uma afirmação é
+verdadeira sem revelar nada além disso. Aqui usamos quatro:
+  - "conheço o x_i desta chave pública h_i" (Schnorr);
+  - "esta cifra contém 0 ou 1" (sem dizer qual);
+  - "esta cédula tem exatamente um voto";
+  - "esta decifração usou a mesma chave x_i da chave pública h_i".
+
+Arquivos: tudo que é público fica em publico/ (é o que o auditor lê).
+Segredos ficam em privado/<entidade>/. Cada comando da CLI é um
+processo separado, então todo estado fica em arquivo.
+
+Inteiros grandes são gravados no JSON como texto hexadecimal.
+
+
+-----------------------------------------------------------
+util.py
+-----------------------------------------------------------
+
+ErroVotacao
+  Exceção para qualquer regra violada (voto duplo, prova inválida,
+  fase errada etc.). main.py mostra a mensagem como "REJEITADO: ...".
+
+raiz(), caminho_publico(nome), caminho_privado(entidade, nome)
+  Montam os caminhos dos arquivos. A pasta base vem da variável de
+  ambiente VOTACAO_DIR (padrão: pasta atual). Os testes usam isso para
+  rodar cada eleição numa pasta temporária.
+
+canonico(obj)
+  JSON com chaves em ordem alfabética e sem espaços. Os mesmos dados
+  viram sempre os mesmos bytes, o que é essencial para assinar,
+  calcular hash e gerar os desafios das provas.
+
+sha256_hex, para_hex, de_hex, ler_json, gravar_json, gravar_texto
+  Hash, conversão de inteiros para texto hexadecimal e leitura e
+  escrita de arquivos.
+
+
+-----------------------------------------------------------
+params.py
+-----------------------------------------------------------
+
+P, Q, G
+  P é o primo de 2048 bits do grupo 14 da RFC 3526, copiado da RFC e
+  conferido contra a fórmula da própria RFC:
+  P = 2^2048 - 2^1984 - 1 + 2^64 * (floor(2^1918 * pi) + 124476).
+  Q = (P - 1) / 2. G = 2, que gera o subgrupo de ordem Q porque P deixa
+  resto 7 na divisão por 8 (2 é resíduo quadrático).
+
+Checagem ao importar
+  Confere G^Q = 1 (mod P). Como Q é primo e G != 1, a ordem de G é
+  exatamente Q.
+
+Por que um subgrupo de ordem prima? No grupo inteiro dá para saber se
+um elemento é resíduo quadrático, o que vazaria um bit do voto. No
+subgrupo de ordem Q vale a hipótese DDH, base da segurança do ElGamal.
+
+
+-----------------------------------------------------------
+elgamal.py   (Parte 1)
+-----------------------------------------------------------
+
+aleatorio_zq()
+  Inteiro uniforme entre 1 e Q-1 com o módulo secrets (gerador
+  criptográfico do sistema). O módulo random é previsível.
+
+elemento_valido(y)
+  Verdadeiro se 1 < y < P e y^Q = 1, ou seja, y está no subgrupo.
+
+cifrar(h, m)
+  Sorteia r novo e devolve ((G^r, G^m * h^r), r). O r é usado só para
+  gerar as provas e depois descartado.
+  Por que r novo toda vez: com o mesmo r, c2/c2' = G^(m - m') e daria
+  para saber se dois votos são iguais.
+
+multiplicar(cifras), apurar(cedulas, n)
+  Produto componente a componente; para cada candidato j, multiplica
+  a j-ésima cifra de todas as cédulas, obtendo a cifra do total.
+
+log_discreto(g_t, maximo)
+  Acha T com G^T = g_t testando T = 0, 1, 2, ... Viável porque T é no
+  máximo o número de cédulas.
+
+(Decifrar com a chave inteira, c2 / c1^x = G^m, só existe nos testes,
+em testes/test_elgamal.py: na eleição ninguém tem x inteiro.
+pow(a, -k, P) calcula o inverso modular de a^k.)
+
+cedula_para_json, cedula_de_json
+  Convertem a cédula de/para pares de textos hexadecimais.
+
+
+-----------------------------------------------------------
+provas.py   (Partes 1 e 2)
+-----------------------------------------------------------
+
+Ideia base: a prova de Chaum-Pedersen.
+  Afirmação: "conheço r tal que A = G^r e B = h^r" (o mesmo r nas duas).
+  1. O provador sorteia w e calcula t1 = G^w e t2 = h^w.
+  2. Recebe um desafio c.
+  3. Responde s = w + c*r (mod Q).
+  Verificação: G^s == t1 * A^c  e  h^s == t2 * B^c.
+  Funciona porque G^s = G^w * G^(r*c) = t1 * A^c (e igual para h).
+  Sem conhecer r, não dá para responder a um c imprevisível.
+
+Fiat-Shamir: em vez de um verificador mandar c, o próprio provador
+calcula c = hash(todos os valores públicos e os t's). Como o hash é
+imprevisível, ele não consegue escolher c a seu favor. A prova vira um
+conjunto de números que qualquer um verifica depois (não interativa).
+
+Truque da simulação: se você escolhe c e s ANTES, pode calcular
+t1 = G^s * A^(-c) e t2 = h^s * B^(-c), e a verificação passa sem saber
+r. Isso só é possível porque você escolheu c; com c vindo do hash,
+não é.
+
+desafio(rotulo, contexto, *valores)
+  c = SHA-256(JSON canônico de [rótulo, contexto, valores]) mod Q.
+  O rótulo separa os tipos de prova; o contexto amarra a prova à
+  eleição e ao eleitor (ou à autoridade e ao candidato), para que uma
+  prova não possa ser copiada para outra cédula.
+
+contexto_cedula, contexto_decifracao
+  Montam esses contextos.
+
+provar_voto(h, cifra, m, r, contexto)   (prova disjuntiva, CDS)
+  Afirmação: "a cifra contém 0 OU contém 1".
+  A cifra contém k exatamente quando (c1, c2 / G^k) = (G^r, h^r), ou
+  seja, quando vale a afirmação de Chaum-Pedersen para (c1, c2/G^k).
+  O eleitor conhece r apenas para o valor verdadeiro m.
+    - Ramo falso (1 - m): sorteia c e s e SIMULA (truque acima).
+    - Ramo verdadeiro (m): sorteia w e faz a prova normal.
+    - Calcula c_total = hash(...) e define c_m = c_total - c_falso.
+  Como c_0 + c_1 tem que dar o hash, ele só pôde escolher um dos dois
+  livremente: o outro ramo obrigatoriamente é verdadeiro. E a prova
+  tem a mesma "cara" nos dois casos, então não revela qual é o real.
+  Para uma cifra de 2, os dois ramos são falsos e não há prova válida.
+
+verificar_voto(h, cifra, prova, contexto)
+  Recalcula t1 e t2 dos dois ramos a partir de (c, s) e confere que
+  c_0 + c_1 == hash.
+
+provar_mesmo_log, verificar_mesmo_log   (Chaum-Pedersen, genérica)
+  Afirmação: "conheço x tal que y1 = g1^x e y2 = g2^x" (o mesmo x).
+  É a "Ideia base" acima com bases quaisquer: t1 = g1^w, t2 = g2^w,
+  c = hash(rótulo, contexto, g1, y1, g2, y2, t1, t2), s = w + c*x.
+  A verificação recalcula t1 = g1^s * y1^(-c) e t2 = g2^s * y2^(-c) e
+  confere o hash. Os quatro valores públicos vão juntos, como o
+  "enunciado" (g1, y1, g2, y2). É usada em dois lugares, só mudando o
+  enunciado:
+    - soma da cédula:  g1 = G, y1 = A, g2 = h, y2 = B / G  (x = R);
+    - decifração:      g1 = G, y1 = h_i, g2 = C1, y2 = d   (x = x_i).
+
+enunciado_soma(h, cifras)
+  O produto das cifras da cédula é (A, B) = (G^R, G^(soma dos m) * h^R),
+  com R = soma dos r. Devolve (G, A, h, B / G): a prova de mesmo
+  logaritmo para esses valores só passa se a soma dos votos for
+  exatamente 1. Junto com a prova anterior, garante "cada cifra é 0 ou
+  1 e há exatamente um voto".
+
+gerar_cedula(h, escolha, n, contexto)
+  Cifra cada candidato, gera uma prova por cifra e a prova da soma,
+  e descarta os r. Devolve as cifras e as provas.
+
+verificar_cedula(h, cifras, provas, contexto)
+  Confere todas as provas da cédula; qualquer dado mal formado
+  resulta em False.
+
+provar_conhecimento, verificar_conhecimento   (Schnorr)
+  Afirmação da autoridade: "conheço x_i tal que h_i = G^x_i".
+  1. Sorteia w e calcula t = G^w.
+  2. c = hash("chave", {eleição, autoridade}, h_i, t)  (Fiat-Shamir).
+  3. Responde s = w + c*x_i (mod Q).
+  Verificação: recalcula t = G^s * h_i^(-c) e confere que o hash dá c.
+  Funciona porque G^s * h_i^(-c) = G^(w + c*x_i) * G^(-c*x_i) = G^w.
+  O contexto amarra a prova à eleição e à autoridade: copiar a prova
+  da autoridade 1 para a 2 não funciona.
+  Para que serve: o ataque h_3 = G^a / (h_1 * h_2) faz a chave
+  conjunta virar G^a, mas quem monta esse h_3 não conhece o seu
+  logaritmo, logo não consegue gerar a prova. Isso vale tanto para a
+  última autoridade a publicar (que já viu h_1 e h_2) quanto para o
+  administrador, que edita o arquivo autoridades.json. Por isso não
+  é preciso uma rodada de compromissos antes da publicação.
+
+produto_das_chaves(eleicao, n, dados)
+  Exige as n autoridades; para cada uma confere subgrupo e prova de
+  Schnorr; devolve o produto dos h_i. Usada para calcular a chave
+  conjunta quando a última autoridade publica.
+
+conferir_chaves(eleicao, n, dados)
+  produto_das_chaves + confere que o campo "chave_conjunta" é esse
+  produto. Usada pelo servidor ao abrir a votação, pela autoridade em
+  autoridade-conferir e, principalmente, pelo eleitor antes de
+  cifrar: o eleitor não confia no valor do arquivo, recalcula.
+
+Prova de decifração (em autoridade.py, com provar_mesmo_log)
+  Afirmação da autoridade: "conheço x_i tal que h_i = G^x_i e
+  d = C1^x_i". Prova que a decifração parcial usou a mesma chave da
+  chave pública. Uma autoridade que publica d multiplicado por algum
+  fator (para desviar votos) não consegue gerar essa prova.
+
+
+-----------------------------------------------------------
+assinatura.py
+-----------------------------------------------------------
+
+RSA de 2048 bits, expoente 65537, padding PSS com SHA-256 (biblioteca
+cryptography, permitida pelo enunciado). PSS usa sal aleatório e tem
+prova de segurança; RSA sem padding é determinístico e maleável.
+gerar_par, privada_para_pem, publica_para_pem, carregar_privada,
+assinar e verificar fazem o que o nome diz; verificar devolve False
+em vez de lançar erro.
+
+
+-----------------------------------------------------------
+autoridade.py   (Parte 2)
+-----------------------------------------------------------
+
+gerar_chave(id)
+  Só na fase "preparacao". Sorteia x_i, calcula h_i = G^x_i, guarda
+  x_i em privado/autoridade_i/ e publica h_i com a prova de Schnorr.
+  Quando a última autoridade publica, calcula a chave conjunta com
+  produto_das_chaves (que já confere todas as provas).
+
+conferir(id)
+  A própria autoridade confere que o h_i publicado é o seu (o que está
+  no seu arquivo privado) e que todas as provas fecham. Roda antes de
+  abrir a votação: é como a autoridade percebe que o administrador
+  trocou a sua chave.
+
+produto_do_quadro()
+  A autoridade recalcula o produto das cédulas direto do quadro
+  público. Não aceita um produto pronto do servidor, porque um
+  administrador malicioso poderia entregar uma cédula individual
+  disfarçada de produto e descobrir aquele voto.
+
+decifrar_parcial(id)
+  Só na fase "encerrada" (justiça). Lê x_i do arquivo privado e
+  publica, para cada candidato, d = C1^x_i e a prova de Chaum-Pedersen.
+
+validar_parciais(eleicao, id, produto, parciais)
+  Confere a prova de cada decifração de uma autoridade. Se falhar,
+  aponta qual autoridade trapaceou.
+
+combinar(c2, parciais)
+  G^T = C2 * (d_1 * d_2 * d_3)^(-1) mod P.
+
+apurar_resultado(forcar)
+  Recusa se faltar autoridade (com --forcar, tenta mesmo assim e falha
+  porque sobra h_i^R). Recalcula o produto pelo quadro, confere TODAS
+  as provas de Chaum-Pedersen, combina e grava resultado.json.
+
+
+-----------------------------------------------------------
+quadro.py   (Parte 3)
+-----------------------------------------------------------
+
+Estrutura: {"genese": hash, "entradas": [ {indice, eleitor, cedula,
+provas, assinatura, hash_anterior, hash}, ... ]}
+
+calcular_genese
+  Hash da configuração (parâmetros, autoridades, eleitores). É o
+  "hash anterior" da primeira entrada.
+
+hash_entrada
+  SHA-256 de todos os campos, menos o próprio hash. Como inclui
+  hash_anterior, cada entrada depende de todas as anteriores.
+
+criar, ler, ultimo_hash, ja_votou
+  Criam e consultam o quadro.
+
+acrescentar(eleitor, cedula, provas, assinatura)
+  Única forma de escrever: sempre no fim. Não há editar nem apagar.
+
+
+-----------------------------------------------------------
+servidor.py   (Parte 3)
+-----------------------------------------------------------
+
+Fases: PREPARACAO -> VOTACAO -> ENCERRADA, em publico/estado.json.
+exigir_fase recusa operações fora de hora.
+
+configurar
+  Exige 2+ candidatos distintos e 3+ autoridades, gera o RSA do
+  servidor e publica params.json.
+
+cadastrar
+  Só na preparação; registra a chave pública do eleitor.
+
+abrir_votacao
+  Exige chaves das autoridades conferidas (conferir_chaves) e
+  eleitores; cria o quadro com a gênese.
+
+mensagem_cedula
+  O que o eleitor assina: {eleição, eleitor, cédula, provas}.
+
+validar_cedula
+  Formato, valores no subgrupo e as provas de validade (provas.py).
+
+receber_cedula, nesta ordem:
+  1. fase de votação;
+  2. eleitor cadastrado (elegibilidade);
+  3. assinatura válida;
+  4. ainda não votou (unicidade);
+  5. formato e provas de validade.
+  Se passar, acrescenta ao quadro e devolve o recibo assinado.
+
+encerrar
+  Publica cabeca.json (total e hash final assinados), muda para
+  ENCERRADA e devolve o hash final, que main.py mostra para ser
+  divulgado fora do sistema.
+
+
+-----------------------------------------------------------
+eleitor.py   (Parte 3)
+-----------------------------------------------------------
+
+gerar_e_cadastrar
+  Gera o par RSA; a pública vai ao servidor, a privada fica com o
+  eleitor.
+
+indice_candidato
+  Converte o nome do candidato ("Azul") na posição da cédula.
+
+votar
+  Antes de cifrar, confere as chaves das autoridades (provas de
+  Schnorr e produto) e recalcula h; se algo não fechar,
+  recusa votar. Gera a cédula com as provas (gerar_cedula), assina,
+  envia e guarda o recibo em privado/eleitor_<id>/recibo.json.
+
+verificar_recibo
+  Confere a assinatura do servidor, a existência da entrada no índice,
+  o eleitor, o hash e o conteúdo.
+
+
+-----------------------------------------------------------
+auditor.py   (Parte 4)
+-----------------------------------------------------------
+
+Regra principal: NÃO importa nenhum arquivo do projeto. Cada grupo de
+verificações é um método: verificar_grupo, verificar_autoridades,
+verificar_cadeia, verificar_cabeca, verificar_cedulas (com
+cedula_valida) e verificar_apuracao (com produto_das_cedulas,
+verificar_decifracoes e verificar_totais). Reimplementa
+JSON canônico, SHA-256, RSA-PSS e a verificação das quatro provas, e lê
+somente publico/. Um erro ou trapaça no servidor não é herdado.
+
+Verificações:
+  - grupo: Q = (P-1)/2 e G de ordem Q;
+  - autoridades: subgrupo e prova de Schnorr de cada h_i e chave
+    conjunta;
+  - cadeia: gênese, índices, hash anterior e hash de cada entrada;
+  - cabeça: assinatura do servidor, hash final e total; com
+    --hash-esperado, compara com o hash divulgado no encerramento
+    (pega um quadro reconstruído pelo administrador);
+  - cédulas: elegibilidade, unicidade, assinatura, formato e as
+    provas de que cada voto é 0 ou 1 e a soma é 1;
+  - apuração: produto recalculado, decifrações de todas as
+    autoridades, prova de Chaum-Pedersen de cada uma, C2 / ∏d = G^T
+    para cada total e soma dos totais = número de cédulas.
+Saída: [OK]/[FALHA] por item e "ELEIÇÃO VÁLIDA" (código 0) ou
+"ELEIÇÃO ADULTERADA OU INVÁLIDA" (código 1).
+
+
+-----------------------------------------------------------
+main.py   (Parte 4)
+-----------------------------------------------------------
+
+Um subcomando por etapa: resetar, configurar, autoridade-gerar,
+autoridade-conferir, cadastrar, abrir-votacao, votar, encerrar,
+autoridade-decifrar, apurar [--forcar], verificar-recibo.
+
+
+-----------------------------------------------------------
+adulterar.py e voto_invalido.py   (ataques da demonstração)
+-----------------------------------------------------------
+
+adulterar.py --indice N [--recalcular]
+  Administrador soma um voto ao candidato 1 numa cédula do quadro.
+  Com --recalcular, refaz toda a cadeia de hashes. Detectado pela
+  assinatura do eleitor, pela prova de validade, pelo produto e, no
+  segundo caso, pelo hash final assinado e pelo hash divulgado.
+
+adulterar.py --decifracao
+  A última autoridade multiplica seus d por G^(-1) e G para mover um
+  voto de um candidato para outro, ajustando o resultado. Totais e
+  soma continuam "batendo": só a prova de Chaum-Pedersen denuncia.
+
+voto_invalido.py --eleitor X --valor 2
+  Eleitor cadastrado tenta cifrar 2 e forjar as provas. O servidor
+  rejeita porque as provas não fecham. A função cedula_invalida monta
+  essa cédula e também é usada pelos testes.
+
+
+-----------------------------------------------------------
+roteiro_demo.sh
+-----------------------------------------------------------
+
+  1. configuração           8. apuração sem a autoridade 3 falha
+  2. chaves e conferência   9. autoridade 3 decifra; resultado
+  3. cadastro e abertura   10. recibo e auditoria (VÁLIDA)
+  4. votação               11. cédula adulterada
+  5. voto duplo            12. cadeia recalculada
+  6. voto com valor 2      13. autoridade desonesta
+  7. encerramento e hash
+
+Os passos 1-5 e 8-11 são os obrigatórios; 6, 12 e 13 são extras e
+podem ser cortados se o tempo apertar. PAUSA=0 roda sem pausas.
+
+Divisão sugerida da fala (10 min): P4 passos 1-3, P1 passos 4 e 6,
+P3 passo 5, P2 passos 7-9, P4 passos 10-13.
+
+
+-----------------------------------------------------------
+testes/   (python -m unittest discover -s testes -t .)
+-----------------------------------------------------------
+
+test_elgamal.py: grupo, cifragem aleatorizada, homomorfismo, apuração.
+test_provas.py: cédula honesta passa; prova presa ao eleitor; valor 2
+  não tem prova; dois votos na mesma cédula falham; prova alterada
+  falha; Chaum-Pedersen honesto passa, d desviado e chave errada
+  falham; Schnorr honesto passa, prova de outra autoridade, de outra
+  chave ou sem conhecer x falham.
+test_eleicao.py: eleição completa, voto duplo, eleitor não cadastrado,
+  assinatura de outro eleitor, voto com valor 2 rejeitado e detectado
+  pelo auditor se inserido direto no quadro, fases, votação só abre
+  com todas as chaves, autoridade ausente, decifração falsa
+  recusada na apuração e detectada pelo auditor, recibo, adulteração,
+  remoção e quadro reconstruído.
+
+
+-----------------------------------------------------------
+AS 4 PERGUNTAS OBRIGATÓRIAS (resposta curta)
+-----------------------------------------------------------
+
+(i) Valor diferente de 0 ou 1: o servidor rejeita, porque a cédula
+    precisa vir com provas de que cada cifra é 0 ou 1 e a soma é 1, e
+    essas provas não podem ser geradas para outro valor. Se o
+    administrador inserir uma cédula assim direto no quadro, o auditor
+    detecta. Sem as provas, um voto de 2 contaria dobrado.
+
+(ii) Todas as autoridades conspiram: somam x e decifram qualquer
+    cédula individual, inclusive antes do fim. Sigilo e justiça caem;
+    integridade, validade e auditabilidade continuam.
+
+(iii) Uma autoridade não participa: sobra o fator h_i^R e a apuração é
+    impossível. Problema de disponibilidade; Shamir (t-de-n) resolveria.
+
+(iv) Recibo: sozinho não prova o voto (só tem índice e hash). Mas quem
+    guardar os r pode provar a terceiros em quem votou. O sistema não
+    é livre de recibo, o que permite coerção. As provas de
+    conhecimento zero não mudam isso: elas não revelam o voto, mas o
+    r continua sendo uma prova de voto se o eleitor o guardar.
